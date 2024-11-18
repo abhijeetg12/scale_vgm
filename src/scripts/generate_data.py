@@ -13,25 +13,28 @@ class DataGenerator:
     def __init__(
         self,
         spark: SparkSession,
+        project_id: str,
+        dataset_id: str,
         sample_data_path: str,
         target_rows: int,
         batch_size: Optional[int] = None,
         num_partitions: Optional[int] = None
     ):
         self.spark = spark
+        self.project_id = project_id
+        self.dataset_id = dataset_id
         self.sample_data_path = sample_data_path
         self.target_rows = target_rows
-        self.batch_size = batch_size or min(10_000_000, target_rows // 10)  # Default 10M or 1/10th
+        self.batch_size = batch_size or min(10_000_000, target_rows // 10)
         self.num_partitions = num_partitions or self._calculate_optimal_partitions()
         self._analyze_sample_data()
 
     def _calculate_optimal_partitions(self) -> int:
-        """Calculate optimal number of partitions based on cluster resources and data size"""
         executor_cores = int(self.spark.conf.get("spark.executor.cores", "2"))
         num_executors = int(self.spark.conf.get("spark.executor.instances", "2"))
         
-        target_partition_size = 128 * 1024 * 1024  # 128MB
-        estimated_row_size = 20  # bytes per row
+        target_partition_size = 128 * 1024 * 1024
+        estimated_row_size = 20
         total_size = self.target_rows * estimated_row_size
         
         size_based_partitions = math.ceil(total_size / target_partition_size)
@@ -40,7 +43,6 @@ class DataGenerator:
         return max(size_based_partitions, resource_based_partitions)
 
     def _analyze_sample_data(self) -> None:
-        """Analyze sample data to determine distribution parameters"""
         try:
             sample_df = pd.read_csv(self.sample_data_path)
             amount_col = sample_df["Amount"]
@@ -61,7 +63,6 @@ class DataGenerator:
             raise
 
     def _generate_distribution_expr(self) -> str:
-        """Create SQL expression for realistic amount distribution"""
         stats = self.stats
         return f"""
         CASE 
@@ -74,7 +75,6 @@ class DataGenerator:
         """
 
     def generate_batch(self, batch_number: int, table_name: str) -> None:
-        """Generate and save a batch of data"""
         try:
             start_id = batch_number * self.batch_size
             end_id = min(start_id + self.batch_size, self.target_rows)
@@ -82,10 +82,14 @@ class DataGenerator:
             df = self.spark.range(start_id, end_id, 1, self.num_partitions)
             df = df.withColumn("amount", expr(self._generate_distribution_expr()))
             
+            # Write to BigQuery
+            bq_table = f"{self.project_id}.{self.dataset_id}.{table_name}_{batch_number}"
             df.write \
-                .format("parquet") \
-                .mode("append") \
-                .saveAsTable(table_name)
+                .format("bigquery") \
+                .option("table", bq_table) \
+                .option("temporaryGcsBucket", f"{self.project_id}-temp") \
+                .mode("overwrite") \
+                .save()
                 
             logger.info(f"Generated batch {batch_number} ({end_id - start_id:,} rows)")
             
@@ -93,27 +97,40 @@ class DataGenerator:
             logger.error(f"Error generating batch {batch_number}: {str(e)}")
             raise
 
-    def generate_dataset(self, output_table: str) -> None:
-        """Generate complete dataset"""
+    def generate_dataset(self, table_name: str) -> None:
         try:
             logger.info(f"Starting generation of {self.target_rows:,} rows")
             num_batches = math.ceil(self.target_rows / self.batch_size)
             
-            # Create table with schema
-            schema = StructType([
-                StructField("id", LongType(), False),
-                StructField("amount", DoubleType(), False)
-            ])
-            
-            empty_df = self.spark.createDataFrame([], schema)
-            empty_df.write.mode("overwrite").saveAsTable(output_table)
-            
             # Generate batches
             for batch in range(num_batches):
-                self.generate_batch(batch, output_table)
-                
+                self.generate_batch(batch, table_name)
+            
+            # Merge batches in BigQuery
+            merge_query = f"""
+            CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.{table_name}_final` AS
+            SELECT id, amount 
+            FROM (
+                {' UNION ALL '.join([
+                    f'SELECT * FROM `{self.project_id}.{self.dataset_id}.{table_name}_{i}`'
+                    for i in range(num_batches)
+                ])}
+            )
+            """
+            
+            self.spark.sql(merge_query)
+            
+            # Cleanup batch tables
+            for batch in range(num_batches):
+                self.spark.sql(
+                    f"DROP TABLE IF EXISTS `{self.project_id}.{self.dataset_id}.{table_name}_{batch}`"
+                )
+            
             # Validate final count
-            final_count = self.spark.table(output_table).count()
+            final_count = self.spark.sql(
+                f"SELECT COUNT(*) as count FROM `{self.project_id}.{self.dataset_id}.{table_name}_final`"
+            ).collect()[0]["count"]
+            
             logger.info(f"Generated {final_count:,} rows in {num_batches} batches")
             
             if final_count != self.target_rows:
@@ -124,5 +141,4 @@ class DataGenerator:
             raise
 
     def get_stats(self) -> Dict[str, Any]:
-        """Return statistics of the generated distribution"""
         return self.stats
