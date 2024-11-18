@@ -1,153 +1,128 @@
 # src/scripts/generate_data.py
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import expr, rand, col, monotonically_increasing_id
+from pyspark.sql.functions import expr, rand, col
 from pyspark.sql.types import StructType, StructField, DoubleType, LongType
 import math
+import pandas as pd
 from src.utils.logging_utils import setup_logger
-from typing import Optional
+from typing import Optional, Dict, Any
 
 logger = setup_logger(__name__)
 
-class LargeScaleDataGenerator:
+class DataGenerator:
     def __init__(
-        self, 
+        self,
         spark: SparkSession,
-        target_rows: int = 1_000_000_000,  # 1 billion rows
-        batch_size: int = 10_000_000,      # 10 million rows per batch
+        sample_data_path: str,
+        target_rows: int,
+        batch_size: Optional[int] = None,
         num_partitions: Optional[int] = None
     ):
         self.spark = spark
+        self.sample_data_path = sample_data_path
         self.target_rows = target_rows
-        self.batch_size = batch_size
-        # Calculate optimal number of partitions if not provided
+        self.batch_size = batch_size or min(10_000_000, target_rows // 10)  # Default 10M or 1/10th
         self.num_partitions = num_partitions or self._calculate_optimal_partitions()
-        
+        self._analyze_sample_data()
+
     def _calculate_optimal_partitions(self) -> int:
-        """Calculate optimal number of partitions based on cluster resources"""
-        conf = self.spark.sparkContext._conf.getAll()
+        """Calculate optimal number of partitions based on cluster resources and data size"""
+        executor_cores = int(self.spark.conf.get("spark.executor.cores", "2"))
+        num_executors = int(self.spark.conf.get("spark.executor.instances", "2"))
         
-        # Get executor config
-        executor_cores = int(dict(conf).get("spark.executor.cores", "2"))
-        num_executors = int(dict(conf).get("spark.executor.instances", "2"))
-        
-        # Aim for partitions to be ~128MB each
-        target_partition_size = 128 * 1024 * 1024  # 128MB in bytes
-        estimated_row_size = 20  # Assuming ~20 bytes per row
+        target_partition_size = 128 * 1024 * 1024  # 128MB
+        estimated_row_size = 20  # bytes per row
         total_size = self.target_rows * estimated_row_size
         
-        # Calculate partitions based on data size and cluster resources
         size_based_partitions = math.ceil(total_size / target_partition_size)
-        resource_based_partitions = executor_cores * num_executors * 2  # 2x cores for optimal parallelism
+        resource_based_partitions = executor_cores * num_executors * 2
         
         return max(size_based_partitions, resource_based_partitions)
 
-    def generate_schema(self) -> StructType:
-        """Define the schema for generated data"""
-        return StructType([
-            StructField("id", LongType(), False),
-            StructField("amount", DoubleType(), False)
-        ])
+    def _analyze_sample_data(self) -> None:
+        """Analyze sample data to determine distribution parameters"""
+        try:
+            sample_df = pd.read_csv(self.sample_data_path)
+            amount_col = sample_df["Amount"]
+            
+            self.stats = {
+                "min": float(amount_col.min()),
+                "max": float(amount_col.max()),
+                "mean": float(amount_col.mean()),
+                "std": float(amount_col.std()),
+                "percentiles": {
+                    p: float(amount_col.quantile(p/100))
+                    for p in [25, 50, 75, 90, 95, 99]
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error analyzing sample data: {str(e)}")
+            raise
 
-    def generate_batch(self, batch_number: int) -> None:
+    def _generate_distribution_expr(self) -> str:
+        """Create SQL expression for realistic amount distribution"""
+        stats = self.stats
+        return f"""
+        CASE 
+            WHEN rand() < 0.25 THEN {stats['percentiles'][25]} + (rand() * ({stats['percentiles'][50]} - {stats['percentiles'][25]}))
+            WHEN rand() < 0.75 THEN {stats['percentiles'][50]} + (rand() * ({stats['percentiles'][75]} - {stats['percentiles'][50]}))
+            WHEN rand() < 0.90 THEN {stats['percentiles'][75]} + (rand() * ({stats['percentiles'][90]} - {stats['percentiles'][75]}))
+            WHEN rand() < 0.95 THEN {stats['percentiles'][90]} + (rand() * ({stats['percentiles'][95]} - {stats['percentiles'][90]}))
+            ELSE {stats['percentiles'][95]} + (rand() * ({stats['percentiles'][99]} - {stats['percentiles'][95]}))
+        END
+        """
+
+    def generate_batch(self, batch_number: int, table_name: str) -> None:
         """Generate and save a batch of data"""
         try:
-            # Calculate batch start ID
             start_id = batch_number * self.batch_size
+            end_id = min(start_id + self.batch_size, self.target_rows)
             
-            # Create batch DataFrame
-            df = self.spark.range(
-                start_id, 
-                start_id + self.batch_size, 
-                1, 
-                self.num_partitions
-            )
-            
-            # Add amount column with realistic distribution
-            df = df.withColumn(
-                "amount",
-                expr("""
-                    case 
-                        when rand() < 0.7 then rand() * 1000  # 70% small transactions
-                        when rand() < 0.9 then rand() * 5000  # 20% medium transactions
-                        else rand() * 20000                   # 10% large transactions
-                    end
-                """)
-            )
-            
-            # Write batch to BigQuery
-            table = f"{self.project_id}.{self.dataset}.credit_data_{batch_number}"
+            df = self.spark.range(start_id, end_id, 1, self.num_partitions)
+            df = df.withColumn("amount", expr(self._generate_distribution_expr()))
             
             df.write \
-                .format("bigquery") \
-                .option("table", table) \
-                .option("temporaryGcsBucket", self.temp_bucket) \
-                .mode("overwrite") \
-                .save()
-            
-            logger.info(f"Successfully generated and saved batch {batch_number}")
+                .format("parquet") \
+                .mode("append") \
+                .saveAsTable(table_name)
+                
+            logger.info(f"Generated batch {batch_number} ({end_id - start_id:,} rows)")
             
         except Exception as e:
             logger.error(f"Error generating batch {batch_number}: {str(e)}")
             raise
 
-    def merge_batches(self) -> None:
-        """Merge all batch tables into final table"""
+    def generate_dataset(self, output_table: str) -> None:
+        """Generate complete dataset"""
         try:
-            # Create merge query
-            batch_tables = [f"credit_data_{i}" for i in range(math.ceil(self.target_rows / self.batch_size))]
-            union_query = " UNION ALL ".join([
-                f"SELECT * FROM `{self.project_id}.{self.dataset}.{table}`"
-                for table in batch_tables
-            ])
-            
-            final_query = f"""
-            CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset}.credit_data_final`
-            AS {union_query}
-            """
-            
-            # Execute merge query
-            self.spark.sql(final_query)
-            
-            logger.info("Successfully merged all batches into final table")
-            
-        except Exception as e:
-            logger.error(f"Error merging batches: {str(e)}")
-            raise
-
-    def cleanup_batch_tables(self) -> None:
-        """Clean up intermediate batch tables"""
-        try:
-            batch_tables = [f"credit_data_{i}" for i in range(math.ceil(self.target_rows / self.batch_size))]
-            
-            for table in batch_tables:
-                self.spark.sql(f"DROP TABLE IF EXISTS `{self.project_id}.{self.dataset}.{table}`")
-            
-            logger.info("Successfully cleaned up batch tables")
-            
-        except Exception as e:
-            logger.error(f"Error cleaning up batch tables: {str(e)}")
-            raise
-
-    def generate_all_data(self) -> None:
-        """Generate all data in batches and merge"""
-        try:
+            logger.info(f"Starting generation of {self.target_rows:,} rows")
             num_batches = math.ceil(self.target_rows / self.batch_size)
             
-            logger.info(f"Starting data generation: {self.target_rows:,} rows in {num_batches} batches")
+            # Create table with schema
+            schema = StructType([
+                StructField("id", LongType(), False),
+                StructField("amount", DoubleType(), False)
+            ])
+            
+            empty_df = self.spark.createDataFrame([], schema)
+            empty_df.write.mode("overwrite").saveAsTable(output_table)
             
             # Generate batches
-            for batch_num in range(num_batches):
-                self.generate_batch(batch_num)
-                logger.info(f"Completed batch {batch_num + 1}/{num_batches}")
+            for batch in range(num_batches):
+                self.generate_batch(batch, output_table)
+                
+            # Validate final count
+            final_count = self.spark.table(output_table).count()
+            logger.info(f"Generated {final_count:,} rows in {num_batches} batches")
             
-            # Merge all batches
-            self.merge_batches()
-            
-            # Cleanup
-            self.cleanup_batch_tables()
-            
-            logger.info("Data generation completed successfully")
-            
+            if final_count != self.target_rows:
+                logger.warning(f"Expected {self.target_rows:,} rows but got {final_count:,}")
+                
         except Exception as e:
-            logger.error(f"Error in data generation: {str(e)}")
+            logger.error(f"Error in dataset generation: {str(e)}")
             raise
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Return statistics of the generated distribution"""
+        return self.stats
