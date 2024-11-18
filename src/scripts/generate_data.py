@@ -13,14 +13,14 @@ class DataGenerator:
     def __init__(
         self,
         spark: SparkSession,
-        bucket_name: str,
+        gcs_bucket: str,
         sample_data_path: str,
         target_rows: int,
         batch_size: Optional[int] = None,
         num_partitions: Optional[int] = None
     ):
         self.spark = spark
-        self.bucket_name = bucket_name
+        self.gcs_bucket = gcs_bucket
         self.sample_data_path = sample_data_path
         self.target_rows = target_rows
         self.batch_size = batch_size or min(10_000_000, target_rows // 10)
@@ -80,8 +80,7 @@ class DataGenerator:
             df = self.spark.range(start_id, end_id, 1, self.num_partitions)
             df = df.withColumn("amount", expr(self._generate_distribution_expr()))
             
-            # Write to GCS bucket as parquet
-            output_path = f"gs://{self.bucket_name}/{folder_name}/batch_{batch_number}"
+            output_path = f"gs://{self.gcs_bucket}/{folder_name}/batch_{batch_number}"
             df.write.mode("overwrite").parquet(output_path)
                 
             logger.info(f"Generated batch {batch_number} ({end_id - start_id:,} rows)")
@@ -95,18 +94,15 @@ class DataGenerator:
             logger.info(f"Starting generation of {self.target_rows:,} rows")
             num_batches = math.ceil(self.target_rows / self.batch_size)
             
-            # Generate batches
             for batch in range(num_batches):
                 self.generate_batch(batch, folder_name)
             
-            # Create final table by reading all batches
-            final_path = f"gs://{self.bucket_name}/{folder_name}/final"
+            final_path = f"gs://{self.gcs_bucket}/{folder_name}/final"
             
             self.spark.read.parquet(
-                f"gs://{self.bucket_name}/{folder_name}/batch_*"
+                f"gs://{self.gcs_bucket}/{folder_name}/batch_*"
             ).write.mode("overwrite").parquet(final_path)
             
-            # Count final rows
             final_count = self.spark.read.parquet(final_path).count()
             logger.info(f"Generated {final_count:,} rows")
             
