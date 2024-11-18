@@ -13,16 +13,14 @@ class DataGenerator:
     def __init__(
         self,
         spark: SparkSession,
-        project_id: str,
-        dataset_id: str,
+        bucket_name: str,
         sample_data_path: str,
         target_rows: int,
         batch_size: Optional[int] = None,
         num_partitions: Optional[int] = None
     ):
         self.spark = spark
-        self.project_id = project_id
-        self.dataset_id = dataset_id
+        self.bucket_name = bucket_name
         self.sample_data_path = sample_data_path
         self.target_rows = target_rows
         self.batch_size = batch_size or min(10_000_000, target_rows // 10)
@@ -74,7 +72,7 @@ class DataGenerator:
         END
         """
 
-    def generate_batch(self, batch_number: int, table_name: str) -> None:
+    def generate_batch(self, batch_number: int, folder_name: str) -> None:
         try:
             start_id = batch_number * self.batch_size
             end_id = min(start_id + self.batch_size, self.target_rows)
@@ -82,14 +80,9 @@ class DataGenerator:
             df = self.spark.range(start_id, end_id, 1, self.num_partitions)
             df = df.withColumn("amount", expr(self._generate_distribution_expr()))
             
-            # Write to BigQuery
-            bq_table = f"{self.project_id}.{self.dataset_id}.{table_name}_{batch_number}"
-            df.write \
-                .format("bigquery") \
-                .option("table", bq_table) \
-                .option("temporaryGcsBucket", f"{self.project_id}-temp") \
-                .mode("overwrite") \
-                .save()
+            # Write to GCS bucket as parquet
+            output_path = f"gs://{self.bucket_name}/{folder_name}/batch_{batch_number}"
+            df.write.mode("overwrite").parquet(output_path)
                 
             logger.info(f"Generated batch {batch_number} ({end_id - start_id:,} rows)")
             
@@ -97,41 +90,25 @@ class DataGenerator:
             logger.error(f"Error generating batch {batch_number}: {str(e)}")
             raise
 
-    def generate_dataset(self, table_name: str) -> None:
+    def generate_dataset(self, folder_name: str) -> None:
         try:
             logger.info(f"Starting generation of {self.target_rows:,} rows")
             num_batches = math.ceil(self.target_rows / self.batch_size)
             
             # Generate batches
             for batch in range(num_batches):
-                self.generate_batch(batch, table_name)
+                self.generate_batch(batch, folder_name)
             
-            # Merge batches in BigQuery
-            merge_query = f"""
-            CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.{table_name}_final` AS
-            SELECT id, amount 
-            FROM (
-                {' UNION ALL '.join([
-                    f'SELECT * FROM `{self.project_id}.{self.dataset_id}.{table_name}_{i}`'
-                    for i in range(num_batches)
-                ])}
-            )
-            """
+            # Create final table by reading all batches
+            final_path = f"gs://{self.bucket_name}/{folder_name}/final"
             
-            self.spark.sql(merge_query)
+            self.spark.read.parquet(
+                f"gs://{self.bucket_name}/{folder_name}/batch_*"
+            ).write.mode("overwrite").parquet(final_path)
             
-            # Cleanup batch tables
-            for batch in range(num_batches):
-                self.spark.sql(
-                    f"DROP TABLE IF EXISTS `{self.project_id}.{self.dataset_id}.{table_name}_{batch}`"
-                )
-            
-            # Validate final count
-            final_count = self.spark.sql(
-                f"SELECT COUNT(*) as count FROM `{self.project_id}.{self.dataset_id}.{table_name}_final`"
-            ).collect()[0]["count"]
-            
-            logger.info(f"Generated {final_count:,} rows in {num_batches} batches")
+            # Count final rows
+            final_count = self.spark.read.parquet(final_path).count()
+            logger.info(f"Generated {final_count:,} rows")
             
             if final_count != self.target_rows:
                 logger.warning(f"Expected {self.target_rows:,} rows but got {final_count:,}")
